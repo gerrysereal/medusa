@@ -1,0 +1,73 @@
+name: DevSecOps Pipeline (Medusa DTC)
+
+on:
+  push:
+    branches: [ "master", "main", "develop" ]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/gerrysereal/medusa
+
+jobs:
+  devsecops:
+    runs-on: self-hosted
+    steps:
+      - name: 1. Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: 2. Secret Scanner - Gitleaks
+        run: |
+          /usr/local/bin/gitleaks detect --source Dockerfile --no-git --exit-code 0
+
+      - name: 3. SAST - Semgrep & IaC - Checkov
+        run: |
+          export PATH="$PATH:$HOME/.local/bin"
+          semgrep scan --config auto Dockerfile || true
+          checkov -f Dockerfile --framework dockerfile --compact || true
+
+      - name: 4. Build Docker Image
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          sudo docker build -t "${IMAGE_NAME}:${SHORT_SHA}" -t "${IMAGE_NAME}:latest" .
+
+      - name: 5. Vulnerability Scan - Trivy
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          sudo trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 "${IMAGE_NAME}:${SHORT_SHA}"
+
+      - name: 6. SBOM Generation - Syft
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          /usr/local/bin/syft "${IMAGE_NAME}:${SHORT_SHA}" -o cyclonedx-json=sbom-medusa.json
+          ls -lh sbom-medusa.json
+
+      - name: 7. Login & Push to GHCR + Sign with Cosign + Import to K3s
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo docker login ghcr.io -u gerrysereal --password-stdin
+          sudo docker push "${IMAGE_NAME}:${SHORT_SHA}"
+          sudo docker push "${IMAGE_NAME}:latest"
+
+          COSIGN_PASSWORD="" /usr/local/bin/cosign sign --key $HOME/.cosign/cosign.key --yes "${IMAGE_NAME}:${SHORT_SHA}" || true
+          sudo docker save "${IMAGE_NAME}:${SHORT_SHA}" | sudo k3s ctr images import -
+
+      - name: 8. Deploy with GitOps (ArgoCD)
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DEPLOY_FILE="/home/aiko/k3s-gitops-stategraph/apps/medusa/deployment.yaml"
+          sed -i "s|image: ghcr.io/gerrysereal/medusa:.*|image: ${IMAGE_NAME}:${SHORT_SHA}|g" "$DEPLOY_FILE"
+
+          cd /home/aiko/k3s-gitops-stategraph
+          git pull origin main --no-rebase
+          git add apps/medusa/deployment.yaml
+          git commit -m "ci(medusa): update signed image to ${SHORT_SHA}" || true
+          git push origin main
+
+      - name: 9. DAST - OWASP ZAP Baseline Scan
+        run: |
+          kubectl rollout status deploy/medusa-app -n default --timeout=90s || true
+          CLUSTER_IP=$(kubectl get svc medusa-svc -n default -o jsonpath='{.spec.clusterIP}')
+          sudo docker run --rm -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "http://${CLUSTER_IP}:9000" -I || true
