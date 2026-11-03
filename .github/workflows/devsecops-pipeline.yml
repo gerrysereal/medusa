@@ -70,4 +70,4 @@ jobs:
         run: |
           kubectl rollout status deploy/medusa-app -n default --timeout=90s || true
           CLUSTER_IP=$(kubectl get svc medusa-svc -n default -o jsonpath='{.spec.clusterIP}')
-          sudo docker run --rm -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "http://${CLUSTER_IP}:9000" -I || true
+          sudo docker run --rm --network host -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t "http://${CLUSTER_IP}:9000" -m 1 -I || true
